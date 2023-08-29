@@ -17,13 +17,6 @@ TODO:
 
  */
 
-define("WP_CACHE_SERVERS", [
-	'default' => [
-		"foo-bar-memcached.gpabqv.0001.use1.cache.amazonaws.com:11211",
-		"foo-bar-memcached.gpabqv.0002.use1.cache.amazonaws.com:11211"
-	]
-]);
-
 if (!defined("WP_CACHE_SERVERS")) {
 	define("WP_CACHE_SERVERS", []);
 }
