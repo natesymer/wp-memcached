@@ -12,19 +12,21 @@ Version: 0.0.1
 
 TODO:
 
-- Somehow, it's just as fast as the default cache...
 - Better stats
 	- Stats should appear in Query Monitor
 
  */
 
-global $memcached_servers;
-$memcached_servers = [
+define("WP_CACHE_SERVERS", [
 	'default' => [
 		"foo-bar-memcached.gpabqv.0001.use1.cache.amazonaws.com:11211",
 		"foo-bar-memcached.gpabqv.0002.use1.cache.amazonaws.com:11211"
 	]
-];
+]);
+
+if (!defined("WP_CACHE_SERVERS")) {
+	define("WP_CACHE_SERVERS", []);
+}
 
 if (!defined("WP_CACHE_PREFIX")) {
 	define("WP_CACHE_PREFIX", 'default');
@@ -57,6 +59,16 @@ function wp_cache_delete($key, $group = 'default') {
 function wp_cache_flush() {
 	global $wp_object_cache;
 	return $wp_object_cache->flush();
+}
+
+function wp_cache_flush_group($group) {
+	global $wp_object_cache;
+	return $wp_object_cache->flush_group($group);
+}
+
+function wp_cache_flush_runtime() {
+	global $wp_object_cache;
+	return $wp_object_cache->flush_runtime();
 }
 
 function wp_cache_get($key, $group = 'default', $force = false, &$found = null) {
@@ -99,6 +111,26 @@ function wp_cache_add_non_persistent_groups($groups) {
 	$wp_object_cache->add_non_persistent_groups($groups);
 }
 
+/**
+ * Determines whether the object cache implementation supports a particular feature.
+ *
+ * Possible values include:
+ *  - `add_multiple`, `set_multiple`, `get_multiple` and `delete_multiple`
+ *  - `flush_runtime` and `flush_group`
+ *
+ * @param string $feature Name of the feature to check for.
+ * @return bool True if the feature is supported, false otherwise.
+ */
+function wp_cache_supports($feature) {
+	switch ($feature) {
+		case 'flush_runtime':
+		case 'flush_group':
+			return true;
+		default:
+			return false;
+	}
+}
+
 /*
 	Design:
 
@@ -132,11 +164,6 @@ function wp_cache_add_non_persistent_groups($groups) {
 */
 
 class WP_Object_Cache {
-	public $prefix = WP_CACHE_PREFIX;
-
-	private $global_flush_guid = null; // TODO: replace with a structure like for groups, but by $blog_id
-	private $group_flush_guids = [];
-
 	public $global_groups = [
 		'blog-details',
 		'blog-id-cache',
@@ -163,44 +190,68 @@ class WP_Object_Cache {
 		'themes'
 	];
 
-	private $cache       = []; // In-memory local cache
-	private $mc          = []; // group => memcached client
+	/**
+	 * The amount of times the cache data was already stored in the cache.
+	 *
+	 * @var int
+	 */
+	public $cache_hits = 0;
 
-	private $stats       = [];
-	private $group_ops   = [];
+	/**
+	 * The amount of tmies the cache data was already stored in the runtime/local cache.
+	 *
+	 * @var int
+	 */
+	public $cache_local_hits = 0;
 
-	private $connection_errors = [];
+	/**
+	 * Amount of times the cache did not have the request in cache.
+	 *
+	 * @var int
+	 */
+	public $cache_misses = 0;
 
-	public $time_total = 0;
-	public $size_total = 0;
-	public $slow_op_microseconds = 0.005; // 5 ms
+	/**
+	 * The number of memcached calls
+	 *
+	 * @var int
+	 */
+	public $cache_calls = 0;
+
+	/**
+	 * The amount of microseconds (μs) spent doing memcached calls
+	 * @var float
+	 */
+
+	public $cache_time = 0;
+
+	/**
+	 * Holds error messages.
+	 *
+	 * @var array
+	 */
+	public $errors = [];
+
+	private $prefix = WP_CACHE_PREFIX;
+	private $global_flush_guid = null; // TODO: replace with a structure like for groups, but by $blog_id
+	private $group_flush_guids = [];
+	private $cache = []; // In-memory local cache
+	private $mc = []; // group => memcached client
 
 	function __construct() {
-		$this->stats = [
-			'get' => 0,
-			'get_local' => 0,
-			'get_multi' => 0,
-			'set' => 0,
-			'set_local' => 0,
-			'add' => 0,
-			'delete' => 0,
-			'delete_local' => 0,
-			'slow-ops' => 0,
-		];
-
-		global $memcached_servers;
-		$buckets = $memcached_servers ?? ['127.0.0.1:11211'];
+		$servers = WP_CACHE_SERVERS ?? ['127.0.0.1:11211'];
 
 		// If we specified raw list of buckets, just
 		// use them all by default
-		if (is_int(key($buckets))) {
-			$buckets = ['default' => $buckets];
+		if (is_int(key($servers))) {
+			$servers = ['default' => $servers];
 		}
 
-		foreach ($buckets as $bucket => $servers) {
-			$this->mc[$bucket] = $this->create_memcached_client();
+		foreach ($servers as $group => $hosts) {
+			$m = new Memcached();
+			$m->setOption(Memcached::OPT_DISTRIBUTION, Memcached::DISTRIBUTION_CONSISTENT);
 
-			foreach ($servers as $i => $server) {
+			foreach ($hosts as $i => $server) {
 				if ('unix://' == substr($server, 0, 7)) {
 					$node = $server;
 					$port = 0;
@@ -214,25 +265,19 @@ class WP_Object_Cache {
 					}
 				}
 
-				if (!$this->mc[$bucket]->addServer($node, $port, 1)) {
-					$this->connection_errors[] = [
-						'host' => $node,
-						'port' => $port,
-					];
+				if (!$m->addServer($node, $port, 1)) {
+					$this->errors[] = "Failed to connect to $node:$port";
 				}
 			}
+
+			$this->mc[$group] = $m;
 		}
 
 		global $blog_id;
 		$this->blog_prefix = is_multisite() ? $blog_id : '';
-
-		$this->cache_hits   =& $this->stats['get'];
-		$this->cache_misses =& $this->stats['add'];
 	}
 
 	private function create_memcached_client() {
-		$m = new Memcached();
-		$m->setOption(Memcached::OPT_DISTRIBUTION, Memcached::DISTRIBUTION_CONSISTENT);
 		return $m;
 	}
 
@@ -289,11 +334,6 @@ class WP_Object_Cache {
 			&& $this->cache[$group][$key]['found'];
 	}
 
-	private function get_data_size($data) {
-		// TODO: implement
-		return 0;
-	}
-
 	private function get_global_flush_guid() {
 		if ($this->global_flush_guid !== null) {
 			return $this->global_flush_guid;
@@ -302,7 +342,7 @@ class WP_Object_Cache {
 		$mc =& $this->get_mc();
 
 		// Load the current global flush guid
-                $remote_value = $mc->get(WP_CACHE_PREFIX);
+                $remote_value = $mc->get($this->prefix);
                 $found_remote = $mc->getResultCode() !== Memcached::RES_NOTFOUND;
 		if ($found_remote && $remote_value) {
 			$this->global_flush_guid = $remote_value;
@@ -317,7 +357,7 @@ class WP_Object_Cache {
 		$guid = $this->generate_guid();
 
 		$mc =& $this->get_mc();
-		$mc->set(WP_CACHE_PREFIX, $guid, 0);
+		$mc->set($this->prefix, $guid, 0);
 		$this->global_flush_guid = $guid;
 		return $guid;
 	}
@@ -334,7 +374,7 @@ class WP_Object_Cache {
 
                 // Load the current global flush guid
                 $found_remote = false;
-                $remote_value = $mc->get(WP_CACHE_PREFIX . ":$group");
+                $remote_value = $mc->get($this->prefix . ":$group");
                 $found_remote = $mc->getResultCode() !== Memcached::RES_NOTFOUND;
 		if ($found_remote && $remote_value) {
 			$this->group_flush_guids[$group] = $remote_value;
@@ -359,20 +399,21 @@ class WP_Object_Cache {
 
 		// TODO: multisite: replace $global_flush_guid with a blog-specific guid
 
-		$prefix = WP_CACHE_PREFIX;
+		$prefix = $this->prefix;
 		$k = "$prefix:$group:$global_flush_guid:$flush_id:$key";
 		
 		return preg_replace( '/\s+/', '', $k);
 	}
 
 	private function timer_start() {
-		$this->time_start = microtime( true );
+		$this->time_start = microtime(true);
 		return true;
 	}
 
 	private function timer_stop() {
 		$time_total = microtime(true) - $this->time_start;
-		$this->time_total += $time_total;
+		$this->cache_time += $time_total;
+		$this->cache_calls += 1;
 		return $time_total;
 	}
 
@@ -424,7 +465,6 @@ class WP_Object_Cache {
 
 		$mc =& $this->get_mc($group);
 
-		$size = $this->get_data_size($data);
 		$this->timer_start();
 		$result = $mc->add($key, $data, $expire);
 		$elapsed = $this->timer_stop();
@@ -549,8 +589,6 @@ class WP_Object_Cache {
 
 		$not_found = $mc->getResultCode() === Memcached::RES_NOTFOUND;
 
-		$this->group_ops_stats('delete', $key, $group, null, $elapsed);
-
 		$this->local_cache_clear($key, $group);
 
 		return $result && !$not_found;
@@ -590,10 +628,11 @@ class WP_Object_Cache {
 
 		if (!$force) {
 			$found_local = false;
-		$local_value = $this->local_cache_get($key, $group, $found_local);
+			$local_value = $this->local_cache_get($key, $group, $found_local);
 
 			if ($found_local) {
 				$found = true;
+				$this->cache_local_hits += 1;
 				return $local_value;
 			}
 		}
@@ -605,9 +644,16 @@ class WP_Object_Cache {
 		$elapsed = $this->timer_stop();
 		$found_remote = $mc->getResultCode() !== Memcached::RES_NOTFOUND;
 
-		$this->local_cache_set($key, $remote_value, $group, true);
+		$this->local_cache_set($key, $remote_value, $group, $found_remote);
 
 		$found = $found_remote;
+
+		if ($found) {
+			$this->cache_hits += 1;
+		} else {
+			$this->cache_misses += 1;
+		}
+
 		return $remote_value;
 	}
 
@@ -635,7 +681,7 @@ class WP_Object_Cache {
 	 * @return bool Always returns true
 	 */
 	public function flush() {
-//		$this->local_cache_flush();
+		$this->local_cache_flush();
 		$this->reset_global_flush_guid();
 		return true;
 	}
@@ -648,6 +694,17 @@ class WP_Object_Cache {
 	public function flush_group($group) {
 		$this->local_cache_flush_group($group);
 		$this->reset_flush_guid($group);
+		return true;
+	}
+
+
+	/**
+	 * Removes all cache items from the in-memory runtime cache
+	 *
+	 * @return bool True on success, false on failure.
+	 */
+	public function flush_runtime() {
+		$this->local_cache_flush();
 		return true;
 	}
 
@@ -664,11 +721,9 @@ class WP_Object_Cache {
 
 		$mc =& $this->get_mc($group);
 
-		$size = $this->get_data_size($data);
 		$this->timer_start();
 		$result = $mc->replace($key, $data, false, $expire);
 		$elapsed = $this->timer_stop();
-		$this->group_ops_stats('replace', $key, $group, $size, $elapsed);
 
 		if (false !== $result) {
 			$this->local_cache_set($key, $data, $group, true);
@@ -686,7 +741,6 @@ class WP_Object_Cache {
 	 */
 	public function set($key, $data, $group = 'default', $expire = 0) {
 		if (in_array($group, $this->ignored_groups)) {
-			$this->group_ops_stats('set_local', $key, $group, null, null);
 			return true;
 		}
 
@@ -703,230 +757,47 @@ class WP_Object_Cache {
 		return $result;
 	}
 
-	// TODO: figure this one out
-	function switch_to_blog($blog_id) {
+	/**
+	 * In multisite, switch blog prefix when switching blogs
+	 *
+	 * @param int $_blog_id Blog ID.
+	 * @return bool Whether or not the blog prefix was switched
+	 */
+	public function switch_to_blog($blog_id) {
+		if (!function_exists('is_multisite') || !is_multisite()) {
+			return false;
+		}
 		$this->blog_prefix = is_multisite() ? (int)$blog_id : '';
-	}
-
-
-
-
-
-	private function increment_stat( $field, $num = 1 ) {
-		if ( ! isset( $this->stats[ $field ] ) ) {
-			$this->stats[ $field ] = $num;
-		} else {
-			$this->stats[ $field ] += $num;
-		}
-	}
-
-	private function group_ops_stats( $op, $keys, $group, $size, $time, $comment = '' ) {
-		/*
-		$this->increment_stat( $op );
-
-		// we have no use of the local ops details for now
-		if ( strpos( $op, '_local' ) ) {
-			return;
-		}
-
-		$this->size_total += $size;
-
-		$keys = $this->strip_memcached_keys( $keys );
-
-		if ( $time > $this->slow_op_microseconds && 'get_multi' !== $op ) {
-			$this->increment_stat( 'slow-ops' );
-			$backtrace = null;
-			if ( function_exists( 'wp_debug_backtrace_summary' ) ) {
-				$backtrace = wp_debug_backtrace_summary();
-			}
-			$this->group_ops['slow-ops'][] = array( $op, $keys, $size, $time, $comment, $group, $backtrace );
-		}
-
-		$this->group_ops[ $group ][] = array( $op, $keys, $size, $time, $comment );
-		 */
+		return true;	
 	}
 
 	/**
-	 * Takes a single (or list) of keys in memcached and returns the WP cache key
+	 * Render data about current cache requests
+	 * Used by the Debug bar plugin
+	 *
+	 * @return void
 	 */
-/*	private function strip_memcached_keys($keys) {
-		if (!is_array($keys)) {
-			$keys = [$keys];
-		}
-
-		foreach ($keys as $key => $value) {
-			$offset = 0;
-
-			list($prefix, $group, $global_flush_guid, $flush_guid, $actual_key) = explode(':', $value, 5);
-			$keys[$key] = $actual_key;
-		}
-
-		if (1 === count($keys)) {
-			return $keys[0];
-		}
-
-		return $keys;
-}*/
-/*
-	function colorize_debug_line( $line, $trailing_html = '' ) {
-		$colors = [
-			'get' => 'green',
-			'get_local' => 'lightgreen',
-			'get_multi' => 'fuchsia',
-			'set' => 'purple',
-			'set_local' => 'orchid',
-			'add' => 'blue',
-			'delete' => 'red',
-			'delete_local' => 'tomato',
-			'slow-ops' => 'crimson',
-		];
-
-		$cmd = substr( $line, 0, strpos( $line, ' ' ) );
-
-		// Start off with a neutral default color...
-		$color_for_cmd = 'brown';
-		// And if the cmd has a specific color, use that instead
-		if ( isset( $colors[ $cmd ] ) ) {
-			$color_for_cmd = $colors[ $cmd ];
-		}
-
-		$cmd2 = "<span style='color:" . esc_attr( $color_for_cmd ) . "; font-weight: bold;'>" . esc_html( $cmd ) . "</span>";
-
-		return $cmd2 . esc_html( substr( $line, strlen( $cmd ) ) ) . "$trailing_html\n";
+	public function stats() {
+	?>
+	<p>
+        	<strong>Cache Hits (memcached):</strong>
+		<?= (int)($this->cache_hits); ?>
+		<br />
+		<strong>Cache Hits (runtime):</strong>
+		<?= (int)($this->cache_local_hits); ?>
+		<br />
+		<strong>Cache Misses:</strong>
+		<?= (int)($this->cache_misses); ?>
+		<br />
+		<strong>Cache Calls:</strong>
+		<?= (int)($this->cache_calls); ?>
+		<br />
+		<strong>Time spent in Memcached:</strong>
+		<?= (float)($this->cache_time); ?>
+		<br />
+		<strong>Cache Size:</strong>
+		<?= number_format_i18n( strlen( serialize( $this->cache ) ) / 1024, 2 ); ?> KB
+	</p>
+        <?php
 	}
-
-	function js_toggle() {
-		echo "
-		<script>
-		function memcachedToggleVisibility( id, hidePrefix ) {
-			var element = document.getElementById( id );
-			if ( ! element ) {
-				return;
-			}
-
-			// Hide all element with `hidePrefix` if given. Used to display only one element at a time.
-			if ( hidePrefix ) {
-				var groupStats = document.querySelectorAll( '[id^=\"' + hidePrefix + '\"]' );
-				groupStats.forEach(
-					function ( element ) {
-					    element.style.display = 'none';
-					}
-				);
-			}
-
-			// Toggle the one we clicked.
-			if ( 'none' === element.style.display ) {
-				element.style.display = 'block';
-			} else {
-				element.style.display = 'none';
-			}
-		}
-		</script>
-		";
-	}
- */
-	function stats() {
-		/*
-		$this->js_toggle();
-
-		echo '<h2><span>Total memcache query time:</span>' . number_format_i18n( sprintf( '%0.1f', $this->time_total * 1000 ), 1 ) . ' ms</h2>';
-		echo "\n";
-		echo '<h2><span>Total memcache size:</span>' . esc_html( size_format( $this->size_total, 2 ) ) . '</h2>';
-		echo "\n";
-
-		foreach ( $this->stats as $stat => $n ) {
-			if ( empty( $n ) ) {
-				continue;
-			}
-
-			echo '<h2>';
-			echo $this->colorize_debug_line( "$stat $n" );
-			echo '</h2>';
-		}
-
-		echo "<ul class='debug-menu-links' style='clear:left;font-size:14px;'>\n";
-		$groups = array_keys( $this->group_ops );
-		usort( $groups, 'strnatcasecmp' );
-
-		$active_group = $groups[0];
-		// Always show `slow-ops` first
-		if ( in_array( 'slow-ops', $groups ) ) {
-			$slow_ops_key = array_search( 'slow-ops', $groups );
-			$slow_ops = $groups[ $slow_ops_key ];
-			unset( $groups[ $slow_ops_key ] );
-			array_unshift( $groups, $slow_ops );
-			$active_group = 'slow-ops';
-		}
-
-		$total_ops = 0;
-		$group_titles = array();
-		foreach ( $groups as $group ) {
-			$group_name = $group;
-			if ( empty( $group_name ) ) {
-				$group_name = 'default';
-			}
-			$group_ops = count( $this->group_ops[ $group ] );
-			$group_size = size_format( array_sum( array_map( function ( $op ) { return $op[2]; }, $this->group_ops[ $group ] ) ), 2 );
-			$group_time = number_format_i18n( sprintf( '%0.1f', array_sum( array_map( function ( $op ) { return $op[3]; }, $this->group_ops[ $group ] ) ) * 1000 ), 1 );
-			$total_ops += $group_ops;
-			$group_title = "{$group_name} [$group_ops][$group_size][{$group_time} ms]";
-			$group_titles[ $group ] = $group_title;
-			echo "\t<li><a href='#' onclick='memcachedToggleVisibility( \"object-cache-stats-menu-target-" . esc_js( $group_name ) . "\", \"object-cache-stats-menu-target-\" );'>" . esc_html( $group_title ) . "</a></li>\n";
-		}
-		echo "</ul>\n";
-
-		echo "<div id='object-cache-stats-menu-targets'>\n";
-		foreach ( $groups as $group ) {
-			$group_name = $group;
-			if ( empty( $group_name ) ) {
-				$group_name = 'default';
-			}
-			$current = $active_group == $group ? 'style="display: block"' : 'style="display: none"';
-			echo "<div id='object-cache-stats-menu-target-" . esc_attr( $group_name ) . "' class='object-cache-stats-menu-target' $current>\n";
-			echo '<h3>' . esc_html( $group_titles[ $group ] ) . '</h3>' . "\n";
-			echo "<pre>\n";
-			foreach ( $this->group_ops[ $group ] as $index => $arr ) {
-				printf( '%3d ', $index );
-				echo $this->get_group_ops_line( $index, $arr );
-			}
-			echo "</pre>\n";
-			echo "</div>";
-		}
-
-		echo "</div>";*/
-	}
-/*
-	function get_group_ops_line( $index, $arr ) {
-		// operation
-		$line = "{$arr[0]} ";
-
-		// key
-		$json_encoded_key = json_encode( $arr[1] );
-		$line .= $json_encoded_key . " ";
-
-		// comment
-		if ( ! empty( $arr[4] ) ) {
-			$line .= "{$arr[4]} ";
-		}
-
-		// size
-		if ( isset( $arr[2] ) ) {
-			$line .= '(' . size_format( $arr[2], 2 ) . ') ';
-		}
-
-		// time
-		if ( isset( $arr[3] ) ) {
-			$line .= '(' . number_format_i18n( sprintf( '%0.1f', $arr[3] * 1000 ), 1 ) . ' ms)';
-		}
-
-		// backtrace
-		$bt_link = '';
-		if ( isset( $arr[6] ) ) {
-			$key_hash = md5( $index . $json_encoded_key );
-			$bt_link = " <small><a href='#' onclick='memcachedToggleVisibility( \"object-cache-stats-debug-$key_hash\" );'>Toggle Backtrace</a></small>";
-			$bt_link .= "<pre id='object-cache-stats-debug-$key_hash' style='display:none'>" . esc_html( $arr[6] ) . "</pre>";
-		}
-
-		return $this->colorize_debug_line( $line, $bt_link );
-	}*/
 }
